@@ -20,17 +20,22 @@
  */
 
 const BASE = "https://www.kaggle.com/api/v1";
+const KAGGLE_KEY = process.env.KAGGLE_KEY ?? "";
 const KAGGLE_USERNAME = process.env.KAGGLE_USERNAME ?? "";
-const KERNEL_SLUG = process.env.KAGGLE_KERNEL_SLUG ?? "ltx-video-studio";
+const KERNEL_SLUG = process.env.KAGGLE_KERNEL_SLUG ?? `${KAGGLE_USERNAME}/ltx-video-studio`;
 const NGROK_AUTHTOKEN = process.env.NGROK_AUTHTOKEN ?? "";
 const TS_AUTHKEY = process.env.TAILSCALE_AUTHKEY ?? "";
 const TS_FUNNEL_HOST = process.env.TAILSCALE_FUNNEL_HOST ?? "";
 const TUNNEL_URL = process.env.TUNNEL_URL ?? "";
 
-const AUTH = `Basic ${Buffer.from(`${KAGGLE_USERNAME}:${process.env.KAGGLE_KEY ?? ""}`).toString("base64")}`;
+// Kaggle's API takes the key as a bearer token. HTTP Basic with
+// "username:key" returns 401 Unauthenticated even with a valid key — verified
+// against GET /kernels/quota. The username is still required because it forms
+// the kernel slug, just not for authentication.
+const AUTH = `Bearer ${KAGGLE_KEY}`;
 
 export function configured(): boolean {
-  return Boolean(KAGGLE_USERNAME && process.env.KAGGLE_KEY);
+  return Boolean(KAGGLE_USERNAME && KAGGLE_KEY);
 }
 
 /** True when we know a fixed public URL for the worker. */
