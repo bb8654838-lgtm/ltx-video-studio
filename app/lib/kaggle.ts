@@ -174,32 +174,48 @@ export async function start(
     if (!script.ok) throw new Error(`cannot fetch ${scriptUrl}: ${script.status}`);
     const code = await script.text();
 
-    await kag("/kernels/push", {
+    // Payload shape verified against POST /kernels/push on 2026-10-08.
+    // Everything is top level. Nesting these under a `kernel` object parses but
+    // is silently ignored, which surfaces as "A language must be specified"
+    // (200 with errorNullable) rather than a 4xx — easy to misread as success.
+    // Confirmed working shape:
+    //   { slug, title, codeFile, source, scriptName, language, kernelType,
+    //     isPrivate, enableInternet, kernelExecutionType, machineShape,
+    //     sessionTimeoutSeconds, envVariables }
+    // Note the response is HTTP 200 even on failure; check errorNullable.
+    const payload: Record<string, unknown> = {
+      slug: KERNEL_SLUG,
+      title: "LTX Video Studio Worker",
+      codeFile: runProbe ? "probe.py" : "worker.py",
+      scriptName: runProbe ? "probe.py" : "worker.py",
+      source: code,
+      language: "python",
+      kernelType: "script",
+      isPrivate: true,
+      enableInternet: true,
+      enableGpu: true,
+      machineShape: "NvidiaTeslaT4",
+      kernelExecutionType: 1, // SAVE_AND_RUN_ALL
+      // The safety net. Set here, honoured for the whole session.
+      sessionTimeoutSeconds: timeoutSeconds,
+      envVariables: {
+        NGROK_AUTHTOKEN,
+        TS_AUTHKEY,
+        TS_FUNNEL_HOST,
+        JOB_TOKEN: process.env.JOB_TOKEN ?? "",
+      },
+    };
+
+    const res = await kag("/kernels/push", {
       method: "POST",
-      body: JSON.stringify({
-        kernel: {
-          slug: KERNEL_SLUG,
-          title: "LTX Video Studio Worker",
-          codeFile: "worker.py",
-          language: "python",
-          kernelType: "script",
-          isPrivate: true,
-          enableInternet: true,
-        },
-        scriptName: "worker.py",
-        source: code,
-        kernelExecutionType: 1, // SAVE_AND_RUN_ALL
-        machineShape: "NvidiaTeslaT4",
-        // The safety net. Set here, honoured for the whole session.
-        sessionTimeoutSeconds: timeoutSeconds,
-        envVariables: {
-          NGROK_AUTHTOKEN,
-          TS_AUTHKEY,
-          TS_FUNNEL_HOST,
-          JOB_TOKEN: process.env.JOB_TOKEN ?? "",
-        },
-      }),
+      body: JSON.stringify(payload),
     });
+
+    // /kernels/push answers 200 with a populated errorNullable on rejection.
+    const apiErr = res?.errorNullable;
+    if (apiErr) {
+      return { ok: false, error: `Kaggle rejected the push: ${apiErr}` };
+    }
     return { ok: true };
   } catch (e: any) {
     return { ok: false, error: e?.message ?? String(e) };
