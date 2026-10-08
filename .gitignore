@@ -1,0 +1,33 @@
+# secrets — NEVER commit
+.env
+.env.*
+!.env.example
+*.json.tmp
+
+# kaggle credentials
+kaggle.json
+.kaggle/
+
+# node
+node_modules/
+.next/
+out/
+dist/
+*.tsbuildinfo
+next-env.d.ts
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# outputs
+*.mp4
+*.safetensors
+*.gguf
+output/
+models/
+
+# os
+.DS_Store

@@ -1,0 +1,15 @@
+{
+  "id": 1000,
+  "title": "LTX Video Studio Worker",
+  "code_file": "worker.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "enable_public_url": false,
+  "keywords": [],
+  "dataset_sources": [],
+  "kernel_sources": [],
+  "competition_sources": []
+}
