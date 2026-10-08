@@ -96,22 +96,49 @@ export async function quota(): Promise<Quota> {
 export type RunState = "offline" | "queued" | "running" | "complete" | "error";
 
 export async function status(): Promise<{ state: RunState; detail: string }> {
-  const d = await kag(
-    `/kernels/status?userName=${encodeURIComponent(KAGGLE_USERNAME)}&kernelSlug=${encodeURIComponent(KERNEL_SLUG)}`,
-  );
-  const map: Record<number, RunState> = {
+  // Until the first push creates the kernel, this endpoint answers 403
+  // "Permission 'kernels.get' was denied" rather than 404. That is a normal
+  // pre-first-run state, not a failure, so it must surface as "offline".
+  let d: any;
+  try {
+    d = await kag(
+      `/kernels/status?userName=${encodeURIComponent(KAGGLE_USERNAME)}&kernelSlug=${encodeURIComponent(KERNEL_SLUG)}`,
+    );
+  } catch (e: any) {
+    const msg = String(e?.message ?? e);
+    if (msg.includes("403") || msg.includes("404") || msg.includes("not been created")) {
+      return { state: "offline", detail: "kernel not created yet — press ON" };
+    }
+    throw e;
+  }
+
+  // The endpoint returns `status` as a name ("complete"), while the SDK docs
+  // describe the same enum numerically. Accept both so a Kaggle-side change of
+  // representation cannot silently pin the UI to "offline".
+  const NUMERIC: Record<number, RunState> = {
     0: "queued",
     1: "running",
     2: "complete",
     3: "error",
-    4: "complete", // CANCEL_REQUESTED -> treat as winding down
+    4: "complete", // CANCEL_REQUESTED -> winding down
     5: "complete", // CANCEL_ACKNOWLEDGED
     6: "queued",  // NEW_SCRIPT
   };
-  return {
-    state: map[d.status] ?? "offline",
-    detail: d.failureMessage ?? "",
+  const NAMED: Record<string, RunState> = {
+    QUEUED: "queued",
+    RUNNING: "running",
+    COMPLETE: "complete",
+    ERROR: "error",
+    CANCEL_REQUESTED: "complete",
+    CANCEL_ACKNOWLEDGED: "complete",
+    NEW_SCRIPT: "queued",
   };
+  const raw = d?.status;
+  const state =
+    typeof raw === "number" ? NUMERIC[raw]
+    : typeof raw === "string" ? NAMED[raw.toUpperCase().replace(/^KERNELWORKERSTATUS\./, "")]
+    : undefined;
+  return { state: state ?? "offline", detail: d?.failureMessage ?? "" };
 }
 
 // ── ON ────────────────────────────────────────────────────────────────────
