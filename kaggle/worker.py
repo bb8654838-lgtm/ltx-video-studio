@@ -21,6 +21,7 @@ touching this file.
 # rewrites HF URLs stripping the scheme -> MissingSchema + partial downloads.
 # These are read at import time, so order is load-bearing.
 import os
+import shutil
 
 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "120")
@@ -45,6 +46,7 @@ from pydantic import BaseModel
 MODEL_ID = os.environ.get("LTX_MODEL_ID", "ChrisColeTech/LTX-2.3-uncensored-v1.4-FP8")
 MODEL_DATASET = os.environ.get("LTX_DATASET", "")          # optional pre-staged weights
 NGROK_AUTHTOKEN = os.environ.get("NGROK_AUTHTOKEN", "")
+NGROK_DOMAIN = os.environ.get("NGROK_DOMAIN", "")               # pinned *.ngrok-free.dev
 TS_AUTHKEY = os.environ.get("TS_AUTHKEY", "")
 TS_FUNNEL_HOST = os.environ.get("TS_FUNNEL_HOST", "")       # name.tailnet.ts.net
 JOB_TOKEN = os.environ.get("JOB_TOKEN", "")                 # shared secret with Vercel
@@ -189,32 +191,95 @@ def shutdown(token: str = ""):
 
 
 # ── tunnel ─────────────────────────────────────────────────────────────────
+def _install_ngrok():
+    """Kaggle ships no ngrok. Static binary download beats the apt repo here."""
+    if shutil.which("ngrok"):
+        return True
+    log("downloading ngrok")
+    url = ("https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.zip")
+    try:
+        subprocess.run(["curl", "-fsSL", "-o", "/tmp/ngrok.zip", url],
+                       check=True, timeout=240)
+        subprocess.run(["unzip", "-o", "-q", "/tmp/ngrok.zip", "-d", "/usr/local/bin"],
+                       check=True, timeout=120)
+        os.chmod("/usr/local/bin/ngrok", 0o755)
+        return shutil.which("ngrok") is not None
+    except Exception as e:
+        log(f"ngrok install failed: {e}")
+        return False
+
+
+def _ngrok_url(tries=45):
+    """Read the assigned public URL from ngrok's own local API.
+
+    Discovering the URL at runtime instead of hardcoding it is deliberate: it
+    makes the worker correct whether the tunnel uses a pinned dev domain or a
+    per-session random one. Tailscale proved the hardcoded-name approach breaks
+    here — successive sessions issued ltx-worker, ltx-worker-1 … ltx-worker-5.
+    """
+    import urllib.request
+    for _ in range(tries):
+        time.sleep(2)
+        try:
+            with urllib.request.urlopen("http://127.0.0.1:4040/api/tunnels",
+                                        timeout=5) as r:
+                for t in json.load(r).get("tunnels", []):
+                    if t.get("proto") == "https":
+                        return t["public_url"]
+        except Exception:
+            continue
+    return None
+
+
 def start_tunnel(port=8000):
-    """Expose the local server. Provider chosen by which token is present."""
-    if TS_AUTHKEY and TS_FUNNEL_HOST:
-        log("starting Tailscale Funnel")
-        cmd = ["tailscale", "funnel", "--bg", f"--https={port}", TS_FUNNEL_HOST]
-        subprocess.Popen(cmd, env={**os.environ}, stdout=subprocess.DEVNULL)
-        STATE["tunnel"] = f"https://{TS_FUNNEL_HOST}"
-        return STATE["tunnel"]
-
-    if NGROK_AUTHTOKEN:
+    """Expose the local server. ngrok first; Tailscale kept as a fallback."""
+    if NGROK_AUTHTOKEN and _install_ngrok():
         log("starting ngrok")
-        subprocess.Popen(["ngrok", "http", str(port), "--log", "stdout"],
+        cmd = ["ngrok", "http", str(port), "--log", "stdout"]
+        if NGROK_DOMAIN:
+            # pin the free static dev domain so the URL survives a reconnect
+            cmd += ["--domain", NGROK_DOMAIN]
+        subprocess.Popen(cmd,
                          env={**os.environ, "NGROK_AUTHTOKEN": NGROK_AUTHTOKEN})
-        for _ in range(30):
-            time.sleep(2)
-            try:
-                import urllib.request
-                with urllib.request.urlopen("http://127.0.0.1:4040/api/tunnels") as r:
-                    for t in json.load(r)["tunnels"]:
-                        if t["proto"] == "https":
-                            STATE["tunnel"] = t["public_url"]
-                            return STATE["tunnel"]
-            except Exception:
-                continue
+        url = _ngrok_url()
+        if url:
+            STATE["tunnel"] = url
+            # Vercel parses this exact line out of the kernel log, so the UI
+            # never needs a hardcoded TUNNEL_URL.
+            log(f"TUNNEL_URL_FOR_VERCEL: {url}")
+            return url
+        log("ngrok started but no https tunnel appeared")
 
-    log("WARNING: no tunnel token configured — worker is LAN-only")
+    if TS_AUTHKEY:
+        # Kaggle has no systemd, so tailscaled must be launched by hand.
+        log("starting tailscaled (userspace, no systemd on Kaggle)")
+        subprocess.Popen(
+            ["tailscaled", "--tun=userspace-networking",
+             "--socket=/tmp/ts/tailscaled.sock", "--state=/tmp/ts/state"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        sock = "/tmp/ts/tailscaled.sock"
+        for _ in range(20):
+            time.sleep(2)
+            if os.path.exists(sock):
+                break
+        subprocess.run(["sh", "-c",
+                        f"tailscale --socket={sock} up --authkey={TS_AUTHKEY} "
+                        f"--hostname={TS_FUNNEL_HOST.split('.')[0] or 'ltx-worker'} "
+                        f"--reset"], capture_output=True, timeout=180)
+        subprocess.run(["sh", "-c", f"tailscale --socket={sock} funnel --bg "
+                                    f"--https={port}"], capture_output=True, timeout=90)
+        out = subprocess.run(["sh", "-c", f"tailscale --socket={sock} status --json"],
+                             capture_output=True, text=True, timeout=60).stdout
+        try:
+            dn = json.loads(out).get("Self", {}).get("DNSName", "").rstrip(".")
+            if dn:
+                STATE["tunnel"] = f"https://{dn}"
+                log(f"TUNNEL_URL_FOR_VERCEL: {STATE['tunnel']}")
+                return STATE["tunnel"]
+        except Exception:
+            pass
+
+    log("WARNING: no working tunnel — worker is LAN-only")
     return None
 
 
