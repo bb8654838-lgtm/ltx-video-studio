@@ -122,17 +122,26 @@ stage("imports_ok", configs=sorted(WAN_CONFIGS.keys()))
 log("building WanT2V pipeline")
 t = time.time()
 cfg = WAN_CONFIGS["t2v-1.3B"]
+# t5_cpu=True is what makes this fit. The T5-UMT5-XXL encoder is 11.36 GB and
+# the transformer another 5.68 GB; one T4 has 14.56 GiB usable, so putting both
+# on cuda:0 OOMs the moment generate() moves the encoder onto the device. The
+# second T4 cannot help here because device_id selects a single device for the
+# whole pipeline, and t5_fsdp would need torch.distributed initialised across
+# processes. Encoding one 512-token prompt on CPU costs a minute or two once,
+# and the 20 sampling steps then run entirely on the GPU.
 t2v = wan.WanT2V(config=cfg, checkpoint_dir=WEIGHT_ROOT, device_id=0,
-                 t5_fsdp=False, dit_fsdp=False, t5_cpu=False)
+                 t5_fsdp=False, dit_fsdp=False, t5_cpu=True)
+torch.cuda.empty_cache()
 stage("pipeline_built", seconds=round(time.time() - t, 1),
-      vram_gb=round(torch.cuda.memory_allocated(0) / 1e9, 2))
+      vram_gb=round(torch.cuda.memory_allocated(0) / 1e9, 2),
+      vram_reserved_gb=round(torch.cuda.memory_reserved(0) / 1e9, 2))
 
 # ── 4. generate ───────────────────────────────────────────────────────────
 PROMPT = ("A cinematic shot of a neon-lit rain slicked street in Tokyo at night, "
           "reflections of pink and cyan signs rippling in puddles, slow dolly forward")
 SIZE = (480, 320)          # width, height — must be a multiple of 16 for the patch size
 FRAMES = 25
-STEPS = 20
+STEPS = 12
 SEED = 42
 
 path = os.path.join(OUT, "video.mp4")
