@@ -22,10 +22,16 @@
 const BASE = "https://www.kaggle.com/api/v1";
 const KAGGLE_KEY = process.env.KAGGLE_KEY ?? "";
 const KAGGLE_USERNAME = process.env.KAGGLE_USERNAME ?? "";
-const KERNEL_SLUG = process.env.KAGGLE_KERNEL_SLUG ?? `${KAGGLE_USERNAME}/ltx-video-studio`;
+// Kaggle derives the real slug from the title, not the metadata id: pushing
+// id "user/ltx-video-studio" with title "LTX Video Studio Worker" lands at
+// "user/ltx-video-studio-worker". Pointing at the id is why ON appeared to do
+// nothing — the status poll then looked up a kernel that never existed.
+const KERNEL_SLUG =
+  process.env.KAGGLE_KERNEL_SLUG ?? `${KAGGLE_USERNAME}/ltx-video-studio-worker`;
 const NGROK_AUTHTOKEN = process.env.NGROK_AUTHTOKEN ?? "";
 const TS_AUTHKEY = process.env.TAILSCALE_AUTHKEY ?? "";
 const TS_FUNNEL_HOST = process.env.TAILSCALE_FUNNEL_HOST ?? "";
+const NGROK_DOMAIN = process.env.NGROK_DOMAIN ?? "";
 const TUNNEL_URL = process.env.TUNNEL_URL ?? "";
 
 // Kaggle's API takes the key as a bearer token. HTTP Basic with
@@ -200,9 +206,14 @@ export async function start(
       sessionTimeoutSeconds: timeoutSeconds,
       envVariables: {
         NGROK_AUTHTOKEN,
+        NGROK_DOMAIN,
         TS_AUTHKEY,
         TS_FUNNEL_HOST,
         JOB_TOKEN: process.env.JOB_TOKEN ?? "",
+        // 25 frames at 8 fps is what measured at ~380 s, inside the polling
+        // window; the old 97-frame default was never achievable here.
+        LTX_FRAMES: process.env.LTX_FRAMES ?? "25",
+        LTX_FPS: process.env.LTX_FPS ?? "8",
       },
     };
 

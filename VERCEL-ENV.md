@@ -26,7 +26,8 @@ than storing the kernel source in the function bundle.
 
 | Name | Value | Notes |
 |---|---|---|
-| `KAGGLE_KERNEL_SLUG` | `msdhoni99770/ltx-video-studio` | override the default slug |
+| `KAGGLE_KERNEL_SLUG` | `msdhoni99770/ltx-video-studio-worker` | override the default slug. Kaggle derives the real slug from the **title**, not the metadata id — id `user/ltx-video-studio` + title `LTX Video Studio Worker` lands at `user/ltx-video-studio-worker` |
+| `NGROK_DOMAIN` | `rewind-ambition-iodine.ngrok-free.dev` | pinned ngrok dev domain, passed to the kernel |
 | `TUNNEL_URL` | `https://rewind-ambition-iodine.ngrok-free.dev` | only a fallback |
 
 `TUNNEL_URL` is not required in the normal path. The worker prints

@@ -107,19 +107,41 @@ export default function Studio() {
       const d = await r.json();
       if (d.error) throw new Error(d.error);
 
-      const g = await fetch(d.url, {
-        method: "POST",
-        headers: d.headers,
-        body: JSON.stringify(d.body),
-      });
-      if (!g.ok) throw new Error(`worker ${g.status}: ${(await g.text()).slice(0, 200)}`);
-      const out = await g.json();
-      if (out.video_b64) {
-        setVideo(`data:video/mp4;base64,${out.video_b64}`);
-        setMsg(`✅ Done — seed ${out.seed}`);
-      } else {
-        throw new Error("no video in response");
-      }
+        const g = await fetch(d.submit.url, {
+          method: d.submit.method,
+          headers: d.headers,
+          body: JSON.stringify(d.body),
+        });
+        if (!g.ok) throw new Error(`worker ${g.status}: ${(await g.text()).slice(0, 200)}`);
+        const sub = await g.json();
+        if (!sub.job_id) throw new Error("worker did not return a job id");
+
+        // Poll instead of holding the request open. Measured: generation takes
+        // ~380 s, while both Vercel functions and ngrok's free tier cut a
+        // request at 300 s. 20 min is a generous but finite cap so the UI
+        // cannot hang forever.
+        const pollUrl = `${d.tunnel}/job/${sub.job_id}?token=${encodeURIComponent(
+          d.body.token ?? "",
+        )}`;
+        const deadline = Date.now() + 20 * 60 * 1000;
+        let done: any = null;
+        while (Date.now() < deadline) {
+          await new Promise((r2) => setTimeout(r2, 10000));
+          const p = await fetch(pollUrl, { headers: d.headers });
+          if (!p.ok) continue;
+          const j = await p.json();
+          if (j.state === "done") { done = j; break; }
+          if (j.state === "error") throw new Error(j.error ?? "generation failed");
+          setMsg(`Generating... ${Math.round(j.elapsed_s ?? 0)}s`);
+        }
+        if (!done) throw new Error("timed out after 20 min");
+
+        if (done.video_b64) {
+          setVideo(`data:video/mp4;base64,${done.video_b64}`);
+          setMsg(`Done - ${done.frames} frames in ${done.seconds}s (seed ${done.seed})`);
+        } else {
+          throw new Error("no video in response");
+        }
     } catch (e: any) {
       setMsg(`❌ ${e.message}`);
     }
