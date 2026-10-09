@@ -20,6 +20,20 @@
  */
 
 const BASE = "https://www.kaggle.com/api/v1";
+
+// Two hosts, two behaviours — and getting this wrong is why ON appeared to do
+// nothing for hours.
+//
+//   https://www.kaggle.com/api/v1/kernels/push                      saves only, NEVER runs
+//   https://api.kaggle.com/v1/kernels.KernelsApiService/SaveKernel   saves AND runs
+//
+// Verified: the www endpoint answered {"versionNumber": 8, "error": ""} and the
+// kernel status stayed "complete" with an empty log — a version saved, nothing
+// executed. The api.kaggle.com endpoint answers "Maximum batch GPU session count
+// of 2 reached", a session-creation error only reachable if it really tries to
+// start a run. This is what the Kaggle CLI does internally: kagglesdk builds
+// "https://api.kaggle.com/v1/{service}/{request}".
+const SDK_BASE = "https://api.kaggle.com/v1";
 const KAGGLE_KEY = process.env.KAGGLE_KEY ?? "";
 const KAGGLE_USERNAME = process.env.KAGGLE_USERNAME ?? "";
 // Kaggle derives the real slug from the title, not the metadata id: pushing
@@ -84,6 +98,27 @@ export async function resolveTunnel(): Promise<string> {
     /* fall through to the env var */
   }
   return TUNNEL_URL;
+}
+
+/** Same bearer auth, different host — see SDK_BASE. */
+async function kagSDK(service: string, init: RequestInit): Promise<any> {
+  const res = await fetch(`${SDK_BASE}/${service}`, {
+    ...init,
+    headers: {
+      Authorization: AUTH,
+      "Content-Type": "application/json",
+      ...((init.headers as Record<string, string>) ?? {}),
+    },
+  });
+  const text = await res.text();
+  if (!text) throw new Error(`Kaggle ${service} failed with ${res.status}`);
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error(
+      `Kaggle ${service} returned non-JSON (${res.status}): ${text.slice(0, 200)}`,
+    );
+  }
 }
 
 async function kag(path: string, init: RequestInit = {}): Promise<any> {
@@ -227,18 +262,26 @@ export async function start(
     //     sessionTimeoutSeconds, envVariables }
     // Note the response is HTTP 200 even on failure; check errorNullable.
     const payload: Record<string, unknown> = {
+      id: null,
       slug: KERNEL_SLUG,
-      title: "LTX Video Studio Worker",
-      codeFile: runProbe ? "probe.py" : "worker.py",
-      scriptName: runProbe ? "probe.py" : "worker.py",
-      source: code,
+      newTitle: "LTX Video Studio Worker",
+      text: code,
       language: "python",
       kernelType: "script",
       isPrivate: true,
       enableInternet: true,
       enableGpu: true,
+      enableTpu: false,
       machineShape: "NvidiaTeslaT4",
-      kernelExecutionType: 1, // SAVE_AND_RUN_ALL
+      // Weights ride along as another kernel's output rather than being
+      // downloaded on every ON: 17.55 GB at ~50 MB/s costs ~6 min and the
+      // 20 GB /kaggle/working cap makes a fresh download unreliable. The
+      // worker walks /kaggle/input/notebooks/... to find them.
+      kernelDataSources: [`${KAGGLE_USERNAME}/wan-weights`],
+      datasetDataSources: [],
+      competitionDataSources: [],
+      modelDataSources: [],
+      categoryIds: [],
       // The safety net. Set here, honoured for the whole session.
       sessionTimeoutSeconds: timeoutSeconds,
       envVariables: {
@@ -254,7 +297,7 @@ export async function start(
       },
     };
 
-    const res = await kag("/kernels/push", {
+    const res = await kagSDK("kernels.KernelsApiService/SaveKernel", {
       method: "POST",
       body: JSON.stringify(payload),
     });
