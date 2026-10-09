@@ -298,23 +298,43 @@ def _ngrok_url(tries=45):
 
 
 def start_tunnel(port=8000):
-    """Expose the local server. ngrok first; Tailscale kept as a fallback."""
+    """Expose the local server. ngrok first; Tailscale kept as a fallback.
+
+    A pinned --domain can be refused — ngrok then answers probes with
+    ERR_NGROK_3200 ("endpoint offline") even though the agent is running — so a
+    pinned attempt that yields no URL is retried without --domain to get a random
+    one. Either way the URL is read back from the agent rather than assumed, and
+    it is also written to /kaggle/working/tunnel.json because the kernel log
+    cannot be fetched while a run is still in flight.
+    """
     if NGROK_AUTHTOKEN and _install_ngrok():
-        log("starting ngrok")
-        cmd = ["ngrok", "http", str(port), "--log", "stdout"]
-        if NGROK_DOMAIN:
-            # pin the free static dev domain so the URL survives a reconnect
-            cmd += ["--domain", NGROK_DOMAIN]
-        subprocess.Popen(cmd,
-                         env={**os.environ, "NGROK_AUTHTOKEN": NGROK_AUTHTOKEN})
-        url = _ngrok_url()
-        if url:
-            STATE["tunnel"] = url
-            # Vercel parses this exact line out of the kernel log, so the UI
-            # never needs a hardcoded TUNNEL_URL.
-            log(f"TUNNEL_URL_FOR_VERCEL: {url}")
-            return url
-        log("ngrok started but no https tunnel appeared")
+        for attempt, use_domain in enumerate([NGROK_DOMAIN, ""], start=1):
+            log(f"starting ngrok (attempt {attempt}, domain={use_domain or 'random'})")
+            cmd = ["ngrok", "http", str(port), "--log", "stdout"]
+            if use_domain:
+                cmd += ["--domain", use_domain]
+            subprocess.Popen(cmd,
+                             env={**os.environ, "NGROK_AUTHTOKEN": NGROK_AUTHTOKEN},
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            url = _ngrok_url(tries=20 if use_domain else 40)
+            if url:
+                STATE["tunnel"] = url
+                try:
+                    import urllib.request
+                    with urllib.request.urlopen(url + "/healthz", timeout=25) as r:
+                        log(f"healthz through tunnel: {r.read().decode()[:160]}")
+                except Exception as e:
+                    log(f"healthz probe failed ({type(e).__name__}: {e})")
+                # Vercel parses this exact line out of the kernel log, so the UI
+                # never needs a hardcoded TUNNEL_URL.
+                log(f"TUNNEL_URL_FOR_VERCEL: {url}")
+                try:
+                    json.dump({"tunnel": url, "at": time.time()},
+                              open("/kaggle/working/tunnel.json", "w"))
+                except Exception:
+                    pass
+                return url
+            log("no https tunnel appeared")
 
     if TS_AUTHKEY:
         # Kaggle has no systemd, so tailscaled must be launched by hand.
