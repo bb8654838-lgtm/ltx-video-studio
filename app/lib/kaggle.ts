@@ -58,46 +58,51 @@ export function configured(): boolean {
   return Boolean(KAGGLE_USERNAME && KAGGLE_KEY);
 }
 
-/** True when we know a fixed public URL for the worker. */
+/**
+ * The worker's public URL.
+ *
+ * It is deterministic, not discovered. The kernel pins ngrok to
+ * NGROK_DOMAIN, so the URL is always https://<NGROK_DOMAIN> and the app can
+ * know it before the kernel has even booted — which matters because a turn-ON
+ * takes ~4 min and the UI needs somewhere to point the moment it does.
+ *
+ * This also replaces an earlier attempt to scrape the URL out of
+ * /kernels/output/<slug>. That endpoint only materialises files once the kernel
+ * EXITS, and this kernel is a long-running server with a 5400 s timeout, so the
+ * scrape could never have worked — resolveTunnel() returned "" forever no matter
+ * how healthy the worker was.
+ *
+ * Order: explicit TUNNEL_URL, then the pinned domain, then the worker's own
+ * log (covers the random-subdomain fallback path, where there is no fixed name).
+ */
 export function tunnelUrl(): string {
-  return TUNNEL_URL;
+  if (TUNNEL_URL) return TUNNEL_URL;
+  if (NGROK_DOMAIN) return `https://${NGROK_DOMAIN}`;
+  return "";
 }
 
-/**
- * Resolve the worker's public URL, preferring what the kernel itself reported.
- *
- * TUNNEL_URL is only a fallback: requiring it to be set in the dashboard makes
- * the whole app fail with "TUNNEL_URL not set" even though a perfectly good
- * URL is sitting in the kernel log, because the worker prints
- * TUNNEL_URL_FOR_VERCEL the moment ngrok comes up. The log is authoritative —
- * it reflects the session that is actually running — so it is read first and
- * the env var is the safety net for a session that has not booted yet.
- */
-let _tunnelCache: { url: string; at: number } | null = null;
-
 export async function resolveTunnel(): Promise<string> {
-  // 20 s is short enough that a running session is picked up within a couple of
-  // UI polls without hammering the Kaggle log endpoint.
-  if (_tunnelCache && Date.now() - _tunnelCache.at < 20_000) {
-    return _tunnelCache.url;
-  }
+  const fixed = tunnelUrl();
+  if (fixed) return fixed;
+
+  let _cache: { url: string; at: number } | null = null;
+  if (_cache && Date.now() - _cache.at < 20_000) return _cache.url;
   try {
     const res = await fetch(
       `${BASE}/kernels/output/${encodeURIComponent(KERNEL_SLUG)}`,
       { headers: { Authorization: AUTH }, cache: "no-store" },
     );
     if (res.ok) {
-      const text = await res.text();
-      const m = text.match(/TUNNEL_URL_FOR_VERCEL:\s*(https:\/\/[\w.-]+)/);
+      const m = (await res.text()).match(/TUNNEL_URL_FOR_VERCEL:\s*(https:\/\/[\w.-]+)/);
       if (m) {
-        _tunnelCache = { url: m[1], at: Date.now() };
+        _cache = { url: m[1], at: Date.now() };
         return m[1];
       }
     }
   } catch {
-    /* fall through to the env var */
+    /* no pinned domain configured — nothing else to try */
   }
-  return TUNNEL_URL;
+  return "";
 }
 
 /** Same bearer auth, different host — see SDK_BASE. */
