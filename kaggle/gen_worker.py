@@ -88,12 +88,15 @@ DEV_ENC, DEV_GEN = "cuda:0", "cuda:1"
 stage("torch", version=torch.__version__, cuda=torch.version.cuda,
       devices=[torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())])
 
-for mod in ("imageio", "einops", "ftfy", "dashscope", "regex", "av"):
+# easydict backs wan/configs — without it the import dies before any useful
+# message, since a packaged kernel script prints a bare ImportError.
+for mod in ("imageio", "imageio-ffmpeg", "einops", "ftfy", "regex", "av",
+            "easydict", "dashscope"):
     subprocess.run([sys.executable, "-m", "pip", "install", "-q", mod], check=False,
                    capture_output=True)
 
 sys.path.insert(0, "/kaggle/working/wanpkg")
-if not os.path.isdir("/kaggle/working/wanpkg"):
+if not os.path.isdir("/kaggle/working/wanpkg/wan"):
     # the official repo carries the model definition; diffusers needs ~29 GB of
     # fp32 shards for this model, the original repo is 17.55 GB total
     r = subprocess.run("git clone -q --depth 1 https://github.com/Wan-Video/Wan2.1 wanpkg",
@@ -101,48 +104,28 @@ if not os.path.isdir("/kaggle/working/wanpkg"):
     stage("wan_clone", rc=r.returncode, err=r.stderr.decode("utf-8", "replace")[:300])
 
 stage("imports_begin")
-from wan.modules.model import WanModel  # noqa: E402
-from wan.modules.t5 import T5EncoderModel  # noqa: E402
-from wan.modules.vae import WanVAE  # noqa: E402
-stage("imports_ok")
+import wan  # noqa: E402
+# The package is `wan.configs` (plural) — there is no `wan.config`, and
+# guessing the singular name kills the import before anything is logged.
+from wan.configs import WAN_CONFIGS  # noqa: E402
+from wan.utils.utils import cache_video  # noqa: E402
+stage("imports_ok", configs=sorted(WAN_CONFIGS.keys()))
 
-# ── 3. load, one device each ──────────────────────────────────────────────
-# Signatures read from the cloned repo rather than guessed. Three of them
-# differ from the obvious guess: T5EncoderModel has no `sharded` kwarg, the VAE
-# wrapper takes `vae_pth` (not checkpoint_path), and WanModel takes neither a
-# path nor a device — the state dict has to be loaded and moved by hand.
-log("loading T5 on", DEV_ENC)
+# ── 3. load through the official pipeline ──────────────────────────────────
+# Loading by hand kept failing, because the official loader does three things
+# that are easy to miss: T5 goes to CPU first and is moved afterwards, the
+# tokenizer directory is required, and the transformer is built by
+# WanModel.from_pretrained() from config.json rather than from a raw
+# state_dict. WanT2V already does all of it, so use it and just point it at the
+# staged directory. device_id=0 puts T5, the transformer and the VAE on cuda:0;
+# the second T4 stays free as headroom, since the T5 encoder alone is 11.36 GB.
+log("building WanT2V pipeline")
 t = time.time()
-t5 = T5EncoderModel(text_len=512, dtype=torch.bfloat16, device=DEV_ENC,
-                    checkpoint_path=T5)
-t5.eval()
-stage("t5_loaded", seconds=round(time.time() - t, 1),
+cfg = WAN_CONFIGS["t2v-1.3B"]
+t2v = wan.WanT2V(config=cfg, checkpoint_dir=WEIGHT_ROOT, device_id=0,
+                 t5_fsdp=False, dit_fsdp=False, t5_cpu=False)
+stage("pipeline_built", seconds=round(time.time() - t, 1),
       vram_gb=round(torch.cuda.memory_allocated(0) / 1e9, 2))
-
-log("loading VAE on", DEV_GEN)
-vae = WanVAE(z_dim=16, vae_pth=VAE, dtype=torch.float32, device=DEV_GEN)
-stage("vae_loaded", vram_gb=round(torch.cuda.memory_allocated(1) / 1e9, 2))
-
-log("loading transformer on", DEV_GEN)
-t = time.time()
-model = WanModel(model_type="t2v-1.3B", patch_size=(1, 2, 2), text_len=512,
-                 in_dim=16, dim=1536, ffn_dim=8960, freq_dim=256,
-                 text_dim=4096, out_dim=16, num_heads=12, num_layers=30,
-                 window_size=(-1, -1), qk_norm=True, cross_attn_norm=True,
-                 eps=1e-6)
-ckpt = torch.load(DIFF, map_location="cpu", weights_only=True)
-missing, unexpected = model.load_state_dict(ckpt, strict=False)
-del ckpt
-model = model.to(dtype=torch.bfloat16, device=DEV_GEN).eval()
-torch.cuda.empty_cache()
-stage("model_loaded", seconds=round(time.time() - t, 1),
-      missing=len(missing), unexpected=len(unexpected),
-      vram_gb=round(torch.cuda.memory_allocated(1) / 1e9, 2),
-      vram_reserved_gb=round(torch.cuda.memory_reserved(1) / 1e9, 2))
-
-if missing:
-    stage("FATAL", error="state_dict mismatch", missing=list(missing)[:8])
-    raise SystemExit(1)
 
 # ── 4. generate ───────────────────────────────────────────────────────────
 PROMPT = ("A cinematic shot of a neon-lit rain slicked street in Tokyo at night, "
@@ -152,42 +135,24 @@ FRAMES = 25
 STEPS = 20
 SEED = 42
 
+path = os.path.join(OUT, "video.mp4")
+
 log(f"generating: {PROMPT}")
 t = time.time()
 with torch.no_grad():
-    # Conditioning runs on the encoder device, then crosses to the generative
-    # device as a plain tensor. No device_map on purpose: keeping each half on
-    # exactly one GPU is the point of the split.
-    with torch.cuda.device(DEV_ENC):
-        clip = t5([PROMPT], [512])
-    clip = [c.to(DEV_GEN) for c in clip]
-
-    with torch.cuda.device(DEV_GEN):
-        video = model.sample(
-            prompts=[PROMPT],
-            negative_prompts=["overexposed, static, blurry, low quality, worst quality"],
-            steps=STEPS, size=list(SIZE), duration=FRAMES,
-            seed=SEED, clip_context=clip, save_file=None)
+    video = t2v.generate(
+        prompts=[PROMPT],
+        negative_prompts=["overexposed, static, blurry, low quality, worst quality"],
+        steps=STEPS, size=list(SIZE), duration=FRAMES,
+        seed=SEED, save_file=path)
 gen_s = time.time() - t
-stage("generated", seconds=round(gen_s, 1), shape=list(video.shape))
+stage("generated", seconds=round(gen_s, 1),
+      type=type(video).__name__,
+      shape=list(video.shape) if hasattr(video, "shape") else None)
 
-# ── 5. write the mp4 ──────────────────────────────────────────────────────
-import imageio.v3 as iio  # noqa: E402
-
-path = os.path.join(OUT, "video.mp4")
-# sample() returns latents only when a VAE is not wired in; decode here
-try:
-    video = vae.decode([video]) if torch.is_tensor(video) else video
-except Exception as e:
-    stage("vae_decode_skipped", error=str(e)[:200])
-
-arr = video.detach().float().cpu().clamp(-1, 1).add(1).div(2).mul(255).to(torch.uint8)
-# (B, C, T, H, W) -> (T, H, W, C)
-arr = arr[0].permute(1, 2, 3, 0).numpy()
-iio.imwrite(path, arr, fps=8, codec="libx264", quality=8)
+# ── 5. confirm the mp4 ────────────────────────────────────────────────────
 size_mb = os.path.getsize(path) / 1e6 if os.path.exists(path) else 0
-stage("mp4_written", path=path, size_mb=round(size_mb, 2),
-      shape=list(arr.shape))
+stage("mp4_written", path=path, size_mb=round(size_mb, 2))
 
 ok = size_mb > 0.05
 R["verdict"] = "VIDEO_OK" if ok else "VIDEO_FAIL"

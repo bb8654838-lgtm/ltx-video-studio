@@ -31,6 +31,16 @@ FILES = [
     ("models_t5_umt5-xxl-enc-bf16.pth", "models_t5_umt5-xxl-enc-bf16.pth"),
     ("diffusion_pytorch_model.safetensors", "diffusion_pytorch_model.safetensors"),
     ("Wan2.1_VAE.pth", "Wan2.1_VAE.pth"),
+    # The official WanT2V pipeline builds the model from the checkpoint
+    # directory, not from raw tensors: T5EncoderModel needs tokenizer_path and
+    # WanModel.from_pretrained needs config.json. Staging only the three
+    # weights produced a process that died with no traceback during the T5
+    # load, so these go in the same directory as the weights.
+    ("config.json", "config.json"),
+    ("google/umt5-xxl/tokenizer.json", "google/umt5-xxl/tokenizer.json"),
+    ("google/umt5-xxl/tokenizer_config.json", "google/umt5-xxl/tokenizer_config.json"),
+    ("google/umt5-xxl/special_tokens_map.json", "google/umt5-xxl/special_tokens_map.json"),
+    ("google/umt5-xxl/spiece.model", "google/umt5-xxl/spiece.model"),
 ]
 
 os.makedirs(OUT, exist_ok=True)
@@ -60,6 +70,7 @@ def hf_size(path):
 
 def fetch(src, name, expect, tries=3):
     dest = os.path.join(OUT, name)
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
     part = dest + ".part"          # staged in place: /kaggle/tmp is a separate
                                   # mount, so os.replace across it raises
                                   # "Invalid cross-device link"
