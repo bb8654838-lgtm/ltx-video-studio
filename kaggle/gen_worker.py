@@ -103,6 +103,24 @@ if not os.path.isdir("/kaggle/working/wanpkg/wan"):
                        shell=True, cwd="/kaggle/working", capture_output=True, timeout=600)
     stage("wan_clone", rc=r.returncode, err=r.stderr.decode("utf-8", "replace")[:300])
 
+# Wan's modules/model.py calls flash_attention() directly, and that function
+# opens with `assert FLASH_ATTN_2_AVAILABLE`. flash-attn has no prebuilt wheel
+# for this torch/CUDA pair, and building it takes longer than the kernel lives.
+# The sibling attention() has an identical signature and falls through to
+# torch.nn.functional.scaled_dot_product_attention when flash-attn is absent,
+# so swapping the import and the three call sites is a drop-in replacement.
+model_py = "/kaggle/working/wanpkg/wan/modules/model.py"
+src = open(model_py).read()
+before = src.count("flash_attention(")
+patched = (src.replace("from .attention import flash_attention",
+                       "from .attention import attention")
+              .replace("x = flash_attention(", "x = attention("))
+open(model_py, "w").write(patched)
+stage("flash_attn_patched", calls_before=before,
+      calls_after=patched.count("x = attention("),
+      sdpa_fallback=("FLASH_ATTN_2_AVAILABLE" in open(
+          "/kaggle/working/wanpkg/wan/modules/attention.py").read()))
+
 stage("imports_begin")
 import wan  # noqa: E402
 # The package is `wan.configs` (plural) — there is no `wan.config`, and
