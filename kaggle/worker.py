@@ -103,7 +103,24 @@ def _patch_wan():
     log(f"flash-attn patched: {patched.count('x = attention(')} attention call sites")
 
 
+# Wan's runtime deps are not in the Kaggle image. easydict in particular backs
+# wan/configs, and imageio-ffmpeg is needed to write the mp4 — without these the
+# import dies immediately and load_model() never returns.
+WAN_DEPS = ("easydict", "einops", "ftfy", "regex", "imageio",
+            "imageio-ffmpeg", "av")
+
+
+def _install_deps():
+    for mod in WAN_DEPS:
+        r = subprocess.run([sys.executable, "-m", "pip", "install", "-q", mod],
+                           capture_output=True, timeout=600)
+        if r.returncode != 0:
+            log(f"pip install {mod} failed: {r.stderr.decode('utf-8', 'replace')[:120]}")
+    log(f"deps installed: {', '.join(WAN_DEPS)}")
+
+
 def _prepare_wan():
+    _install_deps()
     if not os.path.isdir(os.path.join(WANPKG, "wan")):
         r = subprocess.run(f"git clone -q --depth 1 {WANGIT} {WANPKG}",
                            shell=True, capture_output=True, timeout=900)
@@ -173,7 +190,9 @@ def healthz():
         "tunnel": STATE["tunnel"],
         "uptime_s": up,
         "jobs": STATE["jobs"],
-        "model": MODEL_ID,
+        "model": "Wan2.1-T2V-1.3B",
+        "async_jobs": True,
+        "poll": "/job/{job_id}",
     }
 
 
@@ -189,8 +208,57 @@ class GenReq(BaseModel):
     token: str = ""
 
 
+# ── async job queue ────────────────────────────────────────────────────────
+# Generation takes ~6 minutes on a T4 and ngrok's free tier cuts an HTTP request
+# at 300 s with ERR_NGROK_3004 — measured: /generate came back 300.3 s after
+# starting with that exact error. No amount of tuning fixes a request that
+# outlives the transport, so the job is split into submit-then-poll:
+#   POST /generate      -> {"job_id": ...} immediately
+#   GET  /job/<id>      -> {state, video_b64} until done
+# Vercel holds the same pair, so the browser never waits on a long request.
+JOBS = {}
+_JOBS_LOCK = threading.Lock()
+
+
+def _run_job(job_id, kind, prompt, width, height, frames, steps, fps, seed, image_b64=None):
+    try:
+        import torch
+        pipe = load_model(kind)
+        frame_num = frames + (4 - frames % 4) % 4
+        t = time.time()
+        video = pipe.generate(
+            input_prompt=prompt or "a cinematic scene",
+            size=(width, height), frame_num=frame_num,
+            sampling_steps=max(1, min(steps, 50)), guide_scale=5.0,
+            n_prompt="overexposed, static, blurry, low quality, worst quality",
+            seed=seed, offload_model=True)
+        arr = (video.detach().float().cpu().clamp(-1, 1)
+               .add(1).div(2).mul(255).to(torch.uint8))
+        if arr.ndim == 4:
+            arr = arr.permute(1, 2, 3, 0)          # (C,T,H,W) -> (T,H,W,C)
+        elif arr.ndim == 3:
+            arr = arr.unsqueeze(-1)
+        out = f"/kaggle/working/out_{job_id}.mp4"
+        import imageio.v3 as iio
+        iio.imwrite(out, arr.numpy(), fps=fps, codec="libx264", quality=8)
+        with _JOBS_LOCK:
+            JOBS[job_id] = {"state": "done", "video_b64": base64.b64encode(
+                open(out, "rb").read()).decode(), "bytes": os.path.getsize(out),
+                "frames": int(arr.shape[0]), "seed": seed,
+                "seconds": round(time.time() - t, 1)}
+        log(f"job {job_id} done in {time.time()-t:.0f}s")
+    except Exception as e:
+        import traceback
+        with _JOBS_LOCK:
+            JOBS[job_id] = {"state": "error",
+                            "error": f"{type(e).__name__}: {e}",
+                            "trace": traceback.format_exc()[-1200:]}
+        log(f"job {job_id} failed: {type(e).__name__}: {e}")
+
+
 @app.post("/generate")
 def generate(req: GenReq):
+    """Submit a job and return at once. Poll GET /job/<id> for the result."""
     if JOB_TOKEN and req.token != JOB_TOKEN:
         raise HTTPException(status_code=401, detail="bad token")
     if not STATE["ready"]:
@@ -198,52 +266,31 @@ def generate(req: GenReq):
     if not req.prompt and not req.image_b64:
         raise HTTPException(status_code=400, detail="need prompt or image")
 
+    import torch
+    job_id = uuid.uuid4().hex[:12]
+    seed = req.seed if req.seed >= 0 else int(torch.randint(0, 2**31 - 1, (1,)).item())
+    with _JOBS_LOCK:
+        JOBS[job_id] = {"state": "running", "seed": seed, "submitted": time.time()}
+    threading.Thread(target=_run_job, args=(
+        job_id, "i2v" if req.image_b64 else "t2v", req.prompt,
+        req.width, req.height, req.frames, req.steps, req.fps, seed,
+        req.image_b64), daemon=True).start()
     STATE["jobs"] += 1
-    kind = "i2v" if req.image_b64 else "t2v"
-    log(f"job #{STATE['jobs']} {kind} prompt={req.prompt[:60]!r} "
-        f"{req.width}x{req.height} frames={req.frames}")
+    log(f"job {job_id} submitted #{STATE['jobs']} {req.width}x{req.height} f={req.frames}")
+    return {"job_id": job_id, "state": "running", "seed": seed}
 
-    pipe = load_model(kind)
-    if pipe is None:
-        raise HTTPException(status_code=503, detail="pipeline unavailable on this GPU")
 
-    out = f"/kaggle/working/out_{uuid.uuid4().hex[:8]}.mp4"
-    try:
-        import torch
-        seed = req.seed if req.seed >= 0 else int(torch.randint(0, 2**31 - 1, (1,)).item())
-        # WanT2V.generate takes input_prompt / frame_num / sampling_steps /
-        # guide_scale / n_prompt - singular names, and no save_file. It decodes
-        # the VAE itself and hands back frames shaped (C, T, H, W).
-        # frame_num has to satisfy (n-1) % (vae_stride[0] * patch_size[0]) == 0,
-        # so snap up to the next valid length instead of passing it raw.
-        frame_num = req.frames + (4 - req.frames % 4) % 4
-        video = pipe.generate(
-            input_prompt=req.prompt or "a cinematic scene",
-            size=(req.width, req.height),
-            frame_num=frame_num,
-            sampling_steps=max(1, min(req.steps, 50)),
-            guide_scale=5.0,
-            n_prompt="overexposed, static, blurry, low quality, worst quality",
-            seed=seed,
-            offload_model=True,
-        )
-        frames = (video.detach().float().cpu().clamp(-1, 1)
-                  .add(1).div(2).mul(255).to(torch.uint8))
-        if frames.ndim == 4:
-            frames = frames.permute(1, 2, 3, 0)      # (C,T,H,W) -> (T,H,W,C)
-        elif frames.ndim == 3:
-            frames = frames.unsqueeze(-1)
-        import imageio.v3 as iio
-        iio.imwrite(out, frames.numpy(), fps=req.fps, codec="libx264", quality=8)
-
-        with open(out, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode()
-        log(f"job done -> {os.path.getsize(out)/1e6:.2f} MB")
-        return {"ok": True, "seed": seed, "video_b64": b64,
-                "bytes": os.path.getsize(out), "frames": int(frames.shape[0])}
-    except Exception as e:
-        log(f"job failed: {type(e).__name__}: {e}")
-        raise HTTPException(status_code=500, detail=str(e)[:300])
+@app.get("/job/{job_id}")
+def job(job_id: str, token: str = ""):
+    if JOB_TOKEN and token != JOB_TOKEN:
+        raise HTTPException(status_code=401, detail="bad token")
+    with _JOBS_LOCK:
+        j = JOBS.get(job_id)
+    if j is None:
+        raise HTTPException(status_code=404, detail="unknown job")
+    j = dict(j)
+    j.setdefault("elapsed_s", round(time.time() - j.get("submitted", time.time())))
+    return j
 
 
 @app.post("/shutdown")
@@ -369,11 +416,111 @@ def start_tunnel(port=8000):
     return None
 
 
+
+def _selftest(port=8000):
+    """Exercise the whole loop from inside the kernel, then exit.
+
+    The worker's real problem is that it is unobservable: it runs for hours and
+    Kaggle only materialises /kaggle/working once the kernel exits, so a run that
+    is stuck looks identical to one that is merely loading. This drives the full
+    path — public URL -> /healthz -> /generate -> mp4 — through the tunnel exactly
+    as Vercel would, records each hop, and exits so the evidence is readable.
+    """
+    import urllib.error
+    import urllib.request
+
+    OUTJ = "/kaggle/working/selftest.json"
+    J = {"steps": [], "t0": time.time()}
+
+    def note(step, **kw):
+        J["steps"].append({"t": round(time.time() - J["t0"], 1), "step": step, **kw})
+        try:
+            json.dump(J, open(OUTJ, "w"), indent=1)
+        except Exception:
+            pass
+        log("SELFTEST " + step + " " + json.dumps(kw)[:170])
+
+    url = STATE.get("tunnel")
+    note("tunnel", url=url)
+
+    def call(path, payload=None, timeout=1800):
+        req = (urllib.request.Request(url + path,
+                data=json.dumps(payload).encode() if payload else None,
+                headers={"Content-Type": "application/json"}, method="POST")
+               if payload else urllib.request.Request(url + path))
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode())
+
+    try:
+        note("healthz_start")
+        for i in range(120):                  # model build is ~200 s; 120 x 10 s caps it at 20 min
+            if os.path.exists("/kaggle/working/load_error.json"):
+                note("load_error_seen", at_seconds=i * 10)
+                break
+            try:
+                h = call("/healthz", timeout=30)
+                note("healthz", ready=h.get("ready"), jobs=h.get("jobs"))
+                if h.get("ready"):
+                    break
+            except Exception as e:
+                note("healthz_wait", error=f"{type(e).__name__}: {str(e)[:90]}")
+            time.sleep(10)
+
+        note("generate_start", prompt="a red kite over a calm sea, cinematic")
+        t = time.time()
+        sub = call("/generate", {"prompt": "a red kite over a calm sea, cinematic",
+                                 "width": 480, "height": 320, "frames": 25,
+                                 "steps": 8, "token": JOB_TOKEN}, timeout=120)
+        note("submitted", job_id=sub.get("job_id"), seconds=round(time.time() - t, 1))
+
+        # Poll rather than hold the request open: ngrok cuts any request at
+        # 300 s with ERR_NGROK_3004 and this generation runs longer than that.
+        jid = sub["job_id"]
+        res = {}
+        for _ in range(300):
+            time.sleep(15)
+            res = call(f"/job/{jid}?token={JOB_TOKEN}", timeout=60)
+            if res.get("state") in ("done", "error"):
+                break
+        note("job_state", state=res.get("state"), elapsed_s=res.get("elapsed_s"),
+             seconds=round(time.time() - t, 1), frames=res.get("frames"))
+        if res.get("state") == "done":
+            raw = base64.b64decode(res["video_b64"])
+            vp = "/kaggle/working/out/selftest.mp4"
+            os.makedirs(os.path.dirname(vp), exist_ok=True)
+            open(vp, "wb").write(raw)
+            note("generated", bytes=len(raw), frames=res.get("frames"))
+        else:
+            note("job_failed", error=res.get("error"), trace=res.get("trace", "")[:400])
+    except urllib.error.HTTPError as e:
+        note("http_error", status=e.code, body=e.read().decode()[:200])
+    except Exception as e:
+        note("error", error=f"{type(e).__name__}: {str(e)[:200]}")
+
+    try:
+        sh = call("/shutdown?token=" + JOB_TOKEN, {"token": JOB_TOKEN}, timeout=30)
+        note("shutdown", resp=sh)
+    except Exception as e:
+        note("shutdown_error", error=f"{type(e).__name__}: {str(e)[:120]}")
+
+    J["verdict"] = ("VIDEO_OK" if any(s["step"] == "generated" and s.get("bytes", 0) > 1000
+                                       for s in J["steps"]) else "SELFTEST_FAIL")
+    try:
+        json.dump(J, open(OUTJ, "w"), indent=1)
+    except Exception:
+        pass
+    log("SELFTEST_VERDICT: " + J["verdict"])
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--probe", action="store_true",
                     help="run the internet-egress probe and exit")
+    ap.add_argument("--selftest", action="store_true",
+                    help="start everything, drive one job through the public URL, "
+                         "write a report and exit — lets a long-running worker be "
+                         "verified in a single batch run")
     args = ap.parse_args()
 
     # ── EGRESS PROBE ───────────────────────────────────────────────────────
@@ -410,10 +557,23 @@ if __name__ == "__main__":
     t0 = time.time()
     try:
         STATE["ready"] = load_model("t2v") is not None
+        log(f"READY={STATE['ready']} (model load {time.time()-t0:.0f}s)")
     except Exception as e:
         STATE["ready"] = False
+        import traceback
+        log("MODEL_LOAD_FAILED " + traceback.format_exc()[-1800:])
+        try:
+            json.dump({"error": traceback.format_exc()[-2500:],
+                       "at": time.time()},
+                      open("/kaggle/working/load_error.json", "w"))
+        except Exception:
+            pass
         log(f"model load failed: {type(e).__name__}: {e}")
     log(f"READY={STATE['ready']} (model load {time.time()-t0:.0f}s)")
+
+    if args.selftest:
+        _selftest(args.port)
+        os._exit(0)
 
     # Belt-and-braces: exit even if nobody presses OFF. session_timeout_seconds
     # is the outer guarantee; this is the inner one.
