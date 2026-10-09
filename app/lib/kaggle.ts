@@ -81,12 +81,13 @@ export function tunnelUrl(): string {
   return "";
 }
 
+let _logCache: { url: string; at: number } | null = null;
+
 export async function resolveTunnel(): Promise<string> {
   const fixed = tunnelUrl();
   if (fixed) return fixed;
 
-  let _cache: { url: string; at: number } | null = null;
-  if (_cache && Date.now() - _cache.at < 20_000) return _cache.url;
+  if (_logCache && Date.now() - _logCache.at < 20_000) return _logCache.url;
   try {
     const res = await fetch(
       `${BASE}/kernels/output/${encodeURIComponent(KERNEL_SLUG)}`,
@@ -95,7 +96,7 @@ export async function resolveTunnel(): Promise<string> {
     if (res.ok) {
       const m = (await res.text()).match(/TUNNEL_URL_FOR_VERCEL:\s*(https:\/\/[\w.-]+)/);
       if (m) {
-        _cache = { url: m[1], at: Date.now() };
+        _logCache = { url: m[1], at: Date.now() };
         return m[1];
       }
     }
