@@ -139,20 +139,52 @@ path = os.path.join(OUT, "video.mp4")
 
 log(f"generating: {PROMPT}")
 t = time.time()
-with torch.no_grad():
-    video = t2v.generate(
-        prompts=[PROMPT],
-        negative_prompts=["overexposed, static, blurry, low quality, worst quality"],
-        steps=STEPS, size=list(SIZE), duration=FRAMES,
-        seed=SEED, save_file=path)
+# The kernel log is not reliably retrievable after a failure, so the traceback
+# goes into the report file: without this a crash after model load leaves a
+# report whose last stage is a success and no explanation for what failed.
+#
+# Signature read from wan/text2video.py, which is a different thing from the
+# WanPipeline-style call this looked like: generate() takes singular
+# `input_prompt`, `frame_num`, `sampling_steps`, `guide_scale`, `n_prompt` and
+# has no `save_file` — it decodes the VAE itself and returns frames. Passing
+# `prompts=`/`steps=`/`duration=` fails on the first unexpected keyword.
+try:
+    with torch.no_grad():
+        video = t2v.generate(
+            input_prompt=PROMPT,
+            size=SIZE,
+            frame_num=FRAMES,
+            sampling_steps=STEPS,
+            guide_scale=5.0,
+            n_prompt="overexposed, static, blurry, low quality, worst quality",
+            seed=SEED,
+            offload_model=True)
+except Exception:
+    import traceback
+    R["traceback"] = traceback.format_exc()[-3000:]
+    save()
+    stage("GENERATE_FAILED")
+    log("GENERATE_FAILED\n" + R["traceback"])
+    raise
 gen_s = time.time() - t
 stage("generated", seconds=round(gen_s, 1),
       type=type(video).__name__,
       shape=list(video.shape) if hasattr(video, "shape") else None)
 
-# ── 5. confirm the mp4 ────────────────────────────────────────────────────
+# ── 5. write the mp4 ──────────────────────────────────────────────────────
+# generate() returns decoded frames in [-1, 1] as (C, T, H, W).
+import numpy as np  # noqa: E402
+import imageio.v3 as iio  # noqa: E402
+
+frames = video.detach().float().cpu().clamp(-1, 1).add(1).div(2).mul(255).to(torch.uint8)
+if frames.ndim == 3:                      # (C, T, H, W) -> (T, H, W, C)
+    frames = frames.permute(1, 2, 3, 0)
+else:
+    frames = frames[0].permute(1, 2, 3, 0)
+arr = frames.numpy()
+iio.imwrite(path, arr, fps=8, codec="libx264", quality=8)
 size_mb = os.path.getsize(path) / 1e6 if os.path.exists(path) else 0
-stage("mp4_written", path=path, size_mb=round(size_mb, 2))
+stage("mp4_written", path=path, size_mb=round(size_mb, 2), shape=list(arr.shape))
 
 ok = size_mb > 0.05
 R["verdict"] = "VIDEO_OK" if ok else "VIDEO_FAIL"
