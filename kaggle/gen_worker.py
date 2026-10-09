@@ -104,21 +104,23 @@ stage("imports_begin")
 from wan.modules.model import WanModel  # noqa: E402
 from wan.modules.t5 import T5EncoderModel  # noqa: E402
 from wan.modules.vae import WanVAE  # noqa: E402
-from wan.utils.utils import cache_video  # noqa: E402
 stage("imports_ok")
 
 # ── 3. load, one device each ──────────────────────────────────────────────
+# Signatures read from the cloned repo rather than guessed. Three of them
+# differ from the obvious guess: T5EncoderModel has no `sharded` kwarg, the VAE
+# wrapper takes `vae_pth` (not checkpoint_path), and WanModel takes neither a
+# path nor a device — the state dict has to be loaded and moved by hand.
 log("loading T5 on", DEV_ENC)
 t = time.time()
 t5 = T5EncoderModel(text_len=512, dtype=torch.bfloat16, device=DEV_ENC,
-                    checkpoint_path=T5, sharded=False)
+                    checkpoint_path=T5)
 t5.eval()
 stage("t5_loaded", seconds=round(time.time() - t, 1),
       vram_gb=round(torch.cuda.memory_allocated(0) / 1e9, 2))
 
 log("loading VAE on", DEV_GEN)
-vae = WanVAE(dtype=torch.float32, device=DEV_GEN, checkpoint_path=VAE)
-vae.eval()
+vae = WanVAE(z_dim=16, vae_pth=VAE, dtype=torch.float32, device=DEV_GEN)
 stage("vae_loaded", vram_gb=round(torch.cuda.memory_allocated(1) / 1e9, 2))
 
 log("loading transformer on", DEV_GEN)
@@ -127,12 +129,20 @@ model = WanModel(model_type="t2v-1.3B", patch_size=(1, 2, 2), text_len=512,
                  in_dim=16, dim=1536, ffn_dim=8960, freq_dim=256,
                  text_dim=4096, out_dim=16, num_heads=12, num_layers=30,
                  window_size=(-1, -1), qk_norm=True, cross_attn_norm=True,
-                 eps=1e-6, checkpoint_path=DIFF, device=DEV_GEN)
-model.eval()
+                 eps=1e-6)
+ckpt = torch.load(DIFF, map_location="cpu", weights_only=True)
+missing, unexpected = model.load_state_dict(ckpt, strict=False)
+del ckpt
+model = model.to(dtype=torch.bfloat16, device=DEV_GEN).eval()
 torch.cuda.empty_cache()
 stage("model_loaded", seconds=round(time.time() - t, 1),
+      missing=len(missing), unexpected=len(unexpected),
       vram_gb=round(torch.cuda.memory_allocated(1) / 1e9, 2),
       vram_reserved_gb=round(torch.cuda.memory_reserved(1) / 1e9, 2))
+
+if missing:
+    stage("FATAL", error="state_dict mismatch", missing=list(missing)[:8])
+    raise SystemExit(1)
 
 # ── 4. generate ───────────────────────────────────────────────────────────
 PROMPT = ("A cinematic shot of a neon-lit rain slicked street in Tokyo at night, "
@@ -145,29 +155,39 @@ SEED = 42
 log(f"generating: {PROMPT}")
 t = time.time()
 with torch.no_grad():
-    # T5 conditioning goes on the encoder device, then crosses to the
-    # generative device as a plain tensor — no device_map here on purpose,
-    # implicit transfers keep each half on exactly one GPU
+    # Conditioning runs on the encoder device, then crosses to the generative
+    # device as a plain tensor. No device_map on purpose: keeping each half on
+    # exactly one GPU is the point of the split.
     with torch.cuda.device(DEV_ENC):
-        clip = t5([prompt], [SIZE[1] // 16 * 16 // 2 * 16]) if False else t5(
-            [PROMPT], [SIZE[1] // 16])
+        clip = t5([PROMPT], [512])
     clip = [c.to(DEV_GEN) for c in clip]
 
     with torch.cuda.device(DEV_GEN):
         video = model.sample(
             prompts=[PROMPT],
             negative_prompts=["overexposed, static, blurry, low quality, worst quality"],
-            steps=STEPS, size=list(SIZE), duration=(FRAMES - 1) // 4 * 4 + 1,
+            steps=STEPS, size=list(SIZE), duration=FRAMES,
             seed=SEED, clip_context=clip, save_file=None)
 gen_s = time.time() - t
 stage("generated", seconds=round(gen_s, 1), shape=list(video.shape))
 
 # ── 5. write the mp4 ──────────────────────────────────────────────────────
+import imageio.v3 as iio  # noqa: E402
+
 path = os.path.join(OUT, "video.mp4")
-cache_video(tensor=video[None], save_file=path, fps=8, nrow=1, normalize=True,
-            value_range=(-1, 1))
+# sample() returns latents only when a VAE is not wired in; decode here
+try:
+    video = vae.decode([video]) if torch.is_tensor(video) else video
+except Exception as e:
+    stage("vae_decode_skipped", error=str(e)[:200])
+
+arr = video.detach().float().cpu().clamp(-1, 1).add(1).div(2).mul(255).to(torch.uint8)
+# (B, C, T, H, W) -> (T, H, W, C)
+arr = arr[0].permute(1, 2, 3, 0).numpy()
+iio.imwrite(path, arr, fps=8, codec="libx264", quality=8)
 size_mb = os.path.getsize(path) / 1e6 if os.path.exists(path) else 0
-stage("mp4_written", path=path, size_mb=round(size_mb, 2))
+stage("mp4_written", path=path, size_mb=round(size_mb, 2),
+      shape=list(arr.shape))
 
 ok = size_mb > 0.05
 R["verdict"] = "VIDEO_OK" if ok else "VIDEO_FAIL"
