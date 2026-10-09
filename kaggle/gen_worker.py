@@ -199,16 +199,20 @@ stage("generated", seconds=round(gen_s, 1),
       shape=list(video.shape) if hasattr(video, "shape") else None)
 
 # ── 5. write the mp4 ──────────────────────────────────────────────────────
-# generate() returns decoded frames in [-1, 1] as (C, T, H, W).
+# generate() returns decoded frames as (C, T, H, W) — measured [3, 25, 320, 480].
+# Guard on ndim only: indexing channels first and then calling a 4-arg permute
+# on the remaining 3-d tensor is what raised, since (T, H, W) has no 4th axis.
 import numpy as np  # noqa: E402
 import imageio.v3 as iio  # noqa: E402
 
 frames = video.detach().float().cpu().clamp(-1, 1).add(1).div(2).mul(255).to(torch.uint8)
-if frames.ndim == 3:                      # (C, T, H, W) -> (T, H, W, C)
-    frames = frames.permute(1, 2, 3, 0)
-else:
-    frames = frames[0].permute(1, 2, 3, 0)
+stage("frames_tensor", shape=list(frames.shape), ndim=frames.ndim)
+if frames.ndim == 4:
+    frames = frames.permute(1, 2, 3, 0)     # (C, T, H, W) -> (T, H, W, C)
+elif frames.ndim == 3:
+    frames = frames.unsqueeze(-1)           # single channel
 arr = frames.numpy()
+assert arr.ndim == 4, f"unexpected frame array {arr.shape}"
 iio.imwrite(path, arr, fps=8, codec="libx264", quality=8)
 size_mb = os.path.getsize(path) / 1e6 if os.path.exists(path) else 0
 stage("mp4_written", path=path, size_mb=round(size_mb, 2), shape=list(arr.shape))
