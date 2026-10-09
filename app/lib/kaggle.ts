@@ -258,20 +258,43 @@ export async function start(
     if (!script.ok) throw new Error(`cannot fetch ${scriptUrl}: ${script.status}`);
     const code = await script.text();
 
-    // Payload shape verified against POST /kernels/push on 2026-10-08.
-    // Everything is top level. Nesting these under a `kernel` object parses but
-    // is silently ignored, which surfaces as "A language must be specified"
-    // (200 with errorNullable) rather than a 4xx — easy to misread as success.
-    // Confirmed working shape:
-    //   { slug, title, codeFile, source, scriptName, language, kernelType,
-    //     isPrivate, enableInternet, kernelExecutionType, machineShape,
-    //     sessionTimeoutSeconds, envVariables }
-    // Note the response is HTTP 200 even on failure; check errorNullable.
+    // ApiSaveKernelRequest has no environment-variable field at all. Its full
+    // field list is: id, slug, new_title, text, language, kernel_type,
+    // dataset/kernel/competition/model_data_sources, category_ids, is_private,
+    // enable_gpu, enable_internet, enable_tpu, session_timeout_seconds and
+    // machine_shape.
+    //
+    // Sending an "envVariables" key is therefore silently dropped rather than
+    // rejected — a probe kernel pushed that way reported token_len=0 and an
+    // empty domain, so ngrok launched with no credentials and never bound a
+    // tunnel. No API path delivers env vars to a script kernel, so the secrets
+    // are written into the source itself. The preamble is prepended to the
+    // worker text, ahead of its module-level `os.environ.get(...)` reads.
+    //
+    // The kernel is private and the code is never returned to the browser; this
+    // is the same inlining that made the first end-to-end selftest pass.
+    const preamble = [
+      "import os as _os",
+      `_os.environ.setdefault("NGROK_AUTHTOKEN", ${JSON.stringify(NGROK_AUTHTOKEN)})`,
+      `_os.environ.setdefault("NGROK_DOMAIN", ${JSON.stringify(NGROK_DOMAIN)})`,
+      `_os.environ.setdefault("JOB_TOKEN", ${JSON.stringify(process.env.JOB_TOKEN ?? "")})`,
+      `_os.environ.setdefault("TS_AUTHKEY", ${JSON.stringify(TS_AUTHKEY)})`,
+      `_os.environ.setdefault("TS_FUNNEL_HOST", ${JSON.stringify(TS_FUNNEL_HOST)})`,
+      // 25 frames at 8 fps is what measured at ~380 s on one T4; the 97-frame
+      // default was never reachable inside the polling window.
+      `_os.environ.setdefault("LTX_FRAMES", "25")`,
+      `_os.environ.setdefault("LTX_FPS", "8")`,
+      "",
+    ].join("\n");
+
+    // Payload shape verified against the SDK SaveKernel service. The sibling
+    // host, www.kaggle.com/api/v1/kernels/push, saves a version and never runs
+    // it — see SDK_BASE.
     const payload: Record<string, unknown> = {
       id: null,
       slug: KERNEL_SLUG,
       newTitle: "LTX Video Studio Worker",
-      text: code,
+      text: preamble + code,
       language: "python",
       kernelType: "script",
       isPrivate: true,
@@ -280,7 +303,7 @@ export async function start(
       enableTpu: false,
       machineShape: "NvidiaTeslaT4",
       // Weights ride along as another kernel's output rather than being
-      // downloaded on every ON: 17.55 GB at ~50 MB/s costs ~6 min and the
+      // downloaded on every ON: 17.57 GB at ~50 MB/s costs ~6 min, and the
       // 20 GB /kaggle/working cap makes a fresh download unreliable. The
       // worker walks /kaggle/input/notebooks/... to find them.
       kernelDataSources: [`${KAGGLE_USERNAME}/wan-weights`],
@@ -290,17 +313,6 @@ export async function start(
       categoryIds: [],
       // The safety net. Set here, honoured for the whole session.
       sessionTimeoutSeconds: timeoutSeconds,
-      envVariables: {
-        NGROK_AUTHTOKEN,
-        NGROK_DOMAIN,
-        TS_AUTHKEY,
-        TS_FUNNEL_HOST,
-        JOB_TOKEN: process.env.JOB_TOKEN ?? "",
-        // 25 frames at 8 fps is what measured at ~380 s, inside the polling
-        // window; the old 97-frame default was never achievable here.
-        LTX_FRAMES: process.env.LTX_FRAMES ?? "25",
-        LTX_FPS: process.env.LTX_FPS ?? "8",
-      },
     };
 
     const res = await kagSDK("kernels.KernelsApiService/SaveKernel", {
@@ -308,8 +320,9 @@ export async function start(
       body: JSON.stringify(payload),
     });
 
-    // /kernels/push answers 200 with a populated errorNullable on rejection.
-    const apiErr = res?.errorNullable;
+    // SaveKernel answers 200 with a populated `error` on rejection, so a
+    // success-looking status code proves nothing and must be inspected.
+    const apiErr = res?.errorNullable ?? res?.error;
     if (apiErr) {
       return { ok: false, error: `Kaggle rejected the push: ${apiErr}` };
     }
