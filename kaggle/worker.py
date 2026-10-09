@@ -45,14 +45,25 @@ from pydantic import BaseModel
 # ── config from environment (set by the Vercel app at push time) ────────────
 MODEL_ID = os.environ.get("LTX_MODEL_ID", "ChrisColeTech/LTX-2.3-uncensored-v1.4-FP8")
 MODEL_DATASET = os.environ.get("LTX_DATASET", "")          # optional pre-staged weights
+# Kaggle kernel-metadata has no env-var field, so when this is pushed by the
+# Vercel app the secrets arrive through the API's envVariables; for a direct
+# `kaggle kernels push` they are written next to this file instead. Env wins.
+try:
+    import _secrets  # type: ignore
+    for _k in ("NGROK_AUTHTOKEN", "NGROK_DOMAIN", "TS_AUTHKEY", "TS_FUNNEL_HOST",
+               "JOB_TOKEN", "WEIGHTS_DIR"):
+        os.environ.setdefault(_k, getattr(_secrets, _k, ""))
+except Exception:
+    pass
+
 NGROK_AUTHTOKEN = os.environ.get("NGROK_AUTHTOKEN", "")
 NGROK_DOMAIN = os.environ.get("NGROK_DOMAIN", "")               # pinned *.ngrok-free.dev
 TS_AUTHKEY = os.environ.get("TS_AUTHKEY", "")
 TS_FUNNEL_HOST = os.environ.get("TS_FUNNEL_HOST", "")       # name.tailnet.ts.net
 JOB_TOKEN = os.environ.get("JOB_TOKEN", "")                 # shared secret with Vercel
 DEFAULT_RES = os.environ.get("LTX_RESOLUTION", "768x512")
-DEFAULT_FRAMES = int(os.environ.get("LTX_FRAMES", "97"))
-DEFAULT_FPS = int(os.environ.get("LTX_FPS", "24"))
+DEFAULT_FRAMES = int(os.environ.get("LTX_FRAMES", "25"))
+DEFAULT_FPS = int(os.environ.get("LTX_FPS", "8"))
 
 app = FastAPI(title="LTX Video Studio Worker")
 app.add_middleware(
@@ -70,47 +81,85 @@ def log(msg):
 
 
 # ── model loading ──────────────────────────────────────────────────────────
+# Wan's modules/model.py calls flash_attention() directly and that function
+# opens with `assert FLASH_ATTN_2_AVAILABLE`. flash-attn ships no wheel for
+# torch 2.11/cu128 and compiling it outlives the kernel, so the import and the
+# four call sites are rewritten to use the sibling attention(): same signature,
+# and it falls through to torch.nn.functional.scaled_dot_product_attention
+# when flash-attn is absent.
+WANGIT = os.environ.get("WAN_GIT", "https://github.com/Wan-Video/Wan2.1")
+WANPKG = "/kaggle/working/wanpkg"
+
 _pipes = {}
 
 
-def load_model(kind: str = "t2v"):
-    """Load the LTX pipeline once and cache it.
+def _patch_wan():
+    mp = os.path.join(WANPKG, "wan/modules/model.py")
+    src = open(mp).read()
+    patched = (src.replace("from .attention import flash_attention",
+                           "from .attention import attention")
+                  .replace("x = flash_attention(", "x = attention("))
+    open(mp, "w").write(patched)
+    log(f"flash-attn patched: {patched.count('x = attention(')} attention call sites")
 
-    T4x2 gives two SEPARATE 16 GB cards, not a pooled 32 GB. A single-process
-    model sees 16 GB. Quantised weights only — FP8 needs Ada/Hopper and the T4
-    is Turing (SM 7.5), so an FP8 checkpoint would be dequantised and give no
-    memory saving at all.
+
+def _prepare_wan():
+    if not os.path.isdir(os.path.join(WANPKG, "wan")):
+        r = subprocess.run(f"git clone -q --depth 1 {WANGIT} {WANPKG}",
+                           shell=True, capture_output=True, timeout=900)
+        if r.returncode != 0:
+            raise RuntimeError(f"wan clone failed: {r.stderr.decode('utf-8', 'replace')[:200]}")
+        log("wan repo cloned")
+    _patch_wan()
+
+
+def find_weights():
+    """Locate the staged checkpoint directory.
+
+    Kernel output attaches under /kaggle/input/notebooks/<owner>/<kernel>/,
+    not /kaggle/input/<kernel>/. Guessing the short path reports "weights not
+    found" while the files sit right there, so the tree is walked instead.
+    """
+    for cand in (os.environ.get("WEIGHTS_DIR", ""), "/kaggle/working/wan"):
+        if cand and os.path.exists(os.path.join(cand, "config.json")):
+            return cand
+    for root, dirs, _ in os.walk("/kaggle/input"):
+        if "wan" in dirs and os.path.exists(os.path.join(root, "wan", "config.json")):
+            return os.path.join(root, "wan")
+        if os.path.basename(root) == "wan" and os.path.exists(os.path.join(root, "config.json")):
+            return root
+    raise FileNotFoundError("staged Wan checkpoint directory not found under /kaggle/input")
+
+
+def load_model(kind: str = "t2v"):
+    """Build the Wan pipeline once and keep it.
+
+    t5_cpu=True is the difference between running and OOM: the T5-UMT5-XXL
+    encoder is 11.36 GB and the transformer another 5.68 GB, while one T4
+    exposes 14.56 GiB. device_id picks a single device for the whole pipeline,
+    so both halves cannot share cuda:0, and t5_fsdp would need torch.distributed
+    initialised across processes. The prompt is encoded once on CPU; every
+    sampling step then runs on the GPU.
     """
     if kind in _pipes:
         return _pipes[kind]
-    log(f"loading pipeline: {kind} (device={DEVICE})")
+    log(f"loading pipeline: {kind}")
     t0 = time.time()
-    try:
-        from ltx_pipelines.distilled import DistilledPipeline  # noqa: F401
-        _pipes[kind] = _build(kind)
-    except Exception as e:                     # fall back to a stub for the probe
-        log(f"pipeline import failed ({type(e).__name__}: {e}) — /healthz will report not-ready")
-        _pipes[kind] = None
-    log(f"pipeline ready in {time.time()-t0:.1f}s")
-    return _pipes[kind]
+    _prepare_wan()
+    sys.path.insert(0, WANPKG)
+    import wan
+    from wan.configs import WAN_CONFIGS          # wan.configs — plural
 
-
-DEVICE = "cuda"
-
-
-def _build(kind):
+    wdir = find_weights()
+    log(f"weights: {wdir}")
+    pipe = wan.WanT2V(config=WAN_CONFIGS["t2v-1.3B"], checkpoint_dir=wdir,
+                      device_id=0, t5_fsdp=False, dit_fsdp=False, t5_cpu=True)
     import torch
-    from ltx_pipelines.distilled import DistilledPipeline
-
-    src = MODEL_DATASET or MODEL_ID
-    log(f"weights source: {src}")
-    return DistilledPipeline(
-        transformer_path=os.path.join(src, "transformer"),
-        text_encoder_path=os.path.join(src, "text_encoder"),
-        video_vae_path=os.path.join(src, "video_vae"),
-        audio_vae_path=os.path.join(src, "audio_vae"),
-        device=DEVICE,
-    )
+    torch.cuda.empty_cache()
+    log(f"pipeline ready in {time.time()-t0:.0f}s "
+        f"(vram {torch.cuda.memory_allocated(0)/1e9:.1f} GB)")
+    _pipes[kind] = pipe
+    return pipe
 
 
 # ── API ────────────────────────────────────────────────────────────────────
@@ -131,10 +180,11 @@ def healthz():
 class GenReq(BaseModel):
     prompt: str = ""
     image_b64: str | None = None      # image-to-video
-    width: int = 768
-    height: int = 512
+    width: int = 480
+    height: int = 320
     frames: int = DEFAULT_FRAMES
     fps: int = DEFAULT_FPS
+    steps: int = 12
     seed: int = -1
     token: str = ""
 
@@ -150,7 +200,8 @@ def generate(req: GenReq):
 
     STATE["jobs"] += 1
     kind = "i2v" if req.image_b64 else "t2v"
-    log(f"job #{STATE['jobs']} {kind} prompt={req.prompt[:60]!r} {req.width}x{req.height}")
+    log(f"job #{STATE['jobs']} {kind} prompt={req.prompt[:60]!r} "
+        f"{req.width}x{req.height} frames={req.frames}")
 
     pipe = load_model(kind)
     if pipe is None:
@@ -160,21 +211,36 @@ def generate(req: GenReq):
     try:
         import torch
         seed = req.seed if req.seed >= 0 else int(torch.randint(0, 2**31 - 1, (1,)).item())
-        pipe.generate(
-            prompt=req.prompt,
-            width=req.width,
-            height=req.height,
-            num_frames=req.frames,
-            fps=req.fps,
+        # WanT2V.generate takes input_prompt / frame_num / sampling_steps /
+        # guide_scale / n_prompt - singular names, and no save_file. It decodes
+        # the VAE itself and hands back frames shaped (C, T, H, W).
+        # frame_num has to satisfy (n-1) % (vae_stride[0] * patch_size[0]) == 0,
+        # so snap up to the next valid length instead of passing it raw.
+        frame_num = req.frames + (4 - req.frames % 4) % 4
+        video = pipe.generate(
+            input_prompt=req.prompt or "a cinematic scene",
+            size=(req.width, req.height),
+            frame_num=frame_num,
+            sampling_steps=max(1, min(req.steps, 50)),
+            guide_scale=5.0,
+            n_prompt="overexposed, static, blurry, low quality, worst quality",
             seed=seed,
-            output_path=out,
-            input_image=req.image_b64,
+            offload_model=True,
         )
+        frames = (video.detach().float().cpu().clamp(-1, 1)
+                  .add(1).div(2).mul(255).to(torch.uint8))
+        if frames.ndim == 4:
+            frames = frames.permute(1, 2, 3, 0)      # (C,T,H,W) -> (T,H,W,C)
+        elif frames.ndim == 3:
+            frames = frames.unsqueeze(-1)
+        import imageio.v3 as iio
+        iio.imwrite(out, frames.numpy(), fps=req.fps, codec="libx264", quality=8)
+
         with open(out, "rb") as f:
             b64 = base64.b64encode(f.read()).decode()
-        log(f"job done -> {out} ({os.path.getsize(out)/1e6:.1f} MB)")
+        log(f"job done -> {os.path.getsize(out)/1e6:.2f} MB")
         return {"ok": True, "seed": seed, "video_b64": b64,
-                "bytes": os.path.getsize(out)}
+                "bytes": os.path.getsize(out), "frames": int(frames.shape[0])}
     except Exception as e:
         log(f"job failed: {type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail=str(e)[:300])
@@ -312,13 +378,22 @@ if __name__ == "__main__":
                                                 port=args.port, log_level="warning"),
                      daemon=True).start()
     time.sleep(3)
+    # Tunnel first, model second. Vercel reads TUNNEL_URL_FOR_VERCEL out of the
+    # log and then polls /healthz, so the URL needs to exist long before the
+    # ~200 s model build finishes. Loading in the foreground also avoids the
+    # obvious trap: kicking off a loader thread and then calling load_model()
+    # again a few seconds later starts a SECOND concurrent load of the same
+    # 17 GB checkpoint, because the cache is only populated on return.
     url = start_tunnel(args.port)
     log(f"tunnel ready: {url}")
 
-    threading.Thread(target=load_model, args=("t2v",), daemon=True).start()
-    time.sleep(30)
-    STATE["ready"] = load_model("t2v") is not None
-    log(f"READY={STATE['ready']}")
+    t0 = time.time()
+    try:
+        STATE["ready"] = load_model("t2v") is not None
+    except Exception as e:
+        STATE["ready"] = False
+        log(f"model load failed: {type(e).__name__}: {e}")
+    log(f"READY={STATE['ready']} (model load {time.time()-t0:.0f}s)")
 
     # Belt-and-braces: exit even if nobody presses OFF. session_timeout_seconds
     # is the outer guarantee; this is the inner one.

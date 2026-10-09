@@ -31,3 +31,5 @@ models/
 
 # os
 .DS_Store
+
+kaggle/_secrets.py
