@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { resolveTunnel } from "@/app/lib/kaggle";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -17,10 +18,17 @@ export const dynamic = "force-dynamic";
  * ever passes through Vercel.
  */
 export async function POST(req: Request) {
-  const tunnel = process.env.TUNNEL_URL;
+  // Read from the kernel log first; the env var is only a fallback. Requiring
+  // the env var meant the app returned "TUNNEL_URL not set" while the worker
+  // was sitting right there printing its own URL.
+  const tunnel = await resolveTunnel();
   if (!tunnel) {
     return NextResponse.json(
-      { error: "TUNNEL_URL not set — worker has no public URL yet" },
+      {
+        error:
+          "No tunnel URL yet — press ON and wait ~15s for ngrok to come up, then retry",
+        hint: "TUNNEL_URL env var can be set as a fallback",
+      },
       { status: 503 },
     );
   }
